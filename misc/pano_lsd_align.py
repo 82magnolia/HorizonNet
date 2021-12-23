@@ -14,6 +14,7 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 import cv2
 from pylsd import lsd
+import torch
 
 
 def computeUVN(n, in_, planeID):
@@ -436,6 +437,108 @@ def combineEdgesN(edges):
     return lines, ori_lines
 
 
+def combineEdgesN_v2(edges):
+    '''
+    Combine some small line segments, should be very conservative
+    OUTPUT
+        lines: combined line segments
+        line format [nx ny nz projectPlaneID umin umax LSfov score]
+        coordN_lines: combined line segments with normal, start coordinate, and end coordinate
+    '''
+    arcList = []
+    for edge in edges:
+        panoLst = edge['panoLst']
+        if len(panoLst) == 0:
+            continue
+        arcList.append(panoLst)
+    arcList = np.vstack(arcList)
+
+    # ori lines
+    numLine = len(arcList)
+    ori_lines = np.zeros((numLine, 8))
+    ori_coordN_lines = np.zeros((numLine, 9))  # Line containing coordinate and normals
+
+    areaXY = np.abs(arcList[:, 2])
+    areaYZ = np.abs(arcList[:, 0])
+    areaZX = np.abs(arcList[:, 1])
+    planeIDs = np.argmax(np.stack([areaXY, areaYZ, areaZX], -1), 1) + 1  # XY YZ ZX
+
+    for i in range(numLine):
+        ori_lines[i, :3] = arcList[i, :3]
+        ori_lines[i, 3] = planeIDs[i]
+        coord1 = arcList[i, 3:6]
+        coord2 = arcList[i, 6:9]
+        uv = xyz2uvN(np.stack([coord1, coord2]), planeIDs[i])
+        umax = uv[:, 0].max() + np.pi
+        umin = uv[:, 0].min() + np.pi
+        if umax - umin > np.pi:
+            ori_lines[i, 4:6] = np.array([umax, umin]) / 2 / np.pi
+        else:
+            ori_lines[i, 4:6] = np.array([umin, umax]) / 2 / np.pi
+        ori_lines[i, 6] = np.arccos((
+            np.dot(coord1, coord2) / (np.linalg.norm(coord1) * np.linalg.norm(coord2))
+            ).clip(-1, 1))
+        ori_lines[i, 7] = arcList[i, 9]
+
+        # Copy assignments to ori_coordN_lines
+        ori_coordN_lines[i, :3] = arcList[i, :3]
+        ori_coordN_lines[i, 3:6] = coord1 / np.linalg.norm(coord1, axis=-1)
+        ori_coordN_lines[i, 6:9] = coord2 / np.linalg.norm(coord2, axis=-1)
+
+    # additive combination
+    lines = ori_lines.copy()
+    coordN_lines = ori_coordN_lines.copy()
+
+    for _ in range(3):
+        numLine = len(lines)
+        valid_line = np.ones(numLine, bool)
+        for i in range(numLine):
+            if not valid_line[i]:
+                continue
+            dotProd = (lines[:, :3] * lines[[i], :3]).sum(1)
+            valid_curr = np.logical_and((np.abs(dotProd) > np.cos(np.pi / 180)), valid_line)
+            valid_curr[i] = False
+            for j in np.nonzero(valid_curr)[0]:
+                range1 = lines[i, 4:6]
+                range2 = lines[j, 4:6]
+                valid_rag = _intersection(range1, range2)
+                if not valid_rag:
+                    continue
+
+                # combine
+                I = np.argmax(np.abs(lines[i, :3]))
+                if lines[i, I] * lines[j, I] > 0:
+                    nc = lines[i, :3] * lines[i, 6] + lines[j, :3] * lines[j, 6]
+                else:
+                    nc = lines[i, :3] * lines[i, 6] - lines[j, :3] * lines[j, 6]
+                nc = nc / np.linalg.norm(nc)
+
+                if _insideRange(range1[0], range2):
+                    nrmin = range2[0]
+                else:
+                    nrmin = range1[0]
+
+                if _insideRange(range1[1], range2):
+                    nrmax = range2[1]
+                else:
+                    nrmax = range1[1]
+
+                u = np.array([[nrmin], [nrmax]]) * 2 * np.pi - np.pi
+                v = computeUVN(nc, u, lines[i, 3])
+                xyz = uv2xyzN(np.hstack([u, v]), lines[i, 3])
+                l = np.arccos(np.dot(xyz[0, :], xyz[1, :]).clip(-1, 1))
+                scr = (lines[i,6]*lines[i,7] + lines[j,6]*lines[j,7]) / (lines[i,6]+lines[j,6])
+
+                lines[i] = [*nc, lines[i, 3], nrmin, nrmax, l, scr]
+                coordN_lines[i] = [*nc, *xyz[0], *xyz[1]]
+                valid_line[j] = False
+
+        lines = lines[valid_line]
+        coordN_lines = coordN_lines[valid_line]
+
+    return lines, coordN_lines
+
+
 def icosahedron2sphere(level):
     # this function use a icosahedron to sample uniformly on a sphere
     a = 2 / (1 + np.sqrt(5))
@@ -852,7 +955,6 @@ def panoEdgeDetection(img, viewSize=320, qError=0.7, refineIter=3):
         lines3rB = refitLineSegmentB(lines3, mainDirect[2], 0)
 
         clines = np.vstack([lines1rB, lines2rB, lines3rB])
-
     panoEdge1r = paintParameterLine(lines1rB, img.shape[1], img.shape[0])
     panoEdge2r = paintParameterLine(lines2rB, img.shape[1], img.shape[0])
     panoEdge3r = paintParameterLine(lines3rB, img.shape[1], img.shape[0])
@@ -866,6 +968,187 @@ def panoEdgeDetection(img, viewSize=320, qError=0.7, refineIter=3):
     panoEdge = panoEdger
 
     return olines, vp, views, edges, panoEdge, score, angle
+
+
+def panoEdgeDetection_v2(img, viewSize=320, return_edge_img=False):
+    '''
+    line detection on panorama
+       INPUT:
+           img: image waiting for detection, double type, range 0~1
+           viewSize: image size of croped views
+           return_edge_img: If True, returns edge image painted with detected edges
+       OUTPUT:
+           coordN_lines: Lines containing [normals starting_coord ending_coord]
+           panoEdge: image for visualize line segments
+    '''
+    cutSize = viewSize
+    fov = np.pi / 3
+    xh = np.arange(-np.pi, np.pi*5/6, np.pi/6)
+    yh = np.zeros(xh.shape[0])
+    xp = np.array([-3/3, -2/3, -1/3, 0/3,  1/3, 2/3, -3/3, -2/3, -1/3,  0/3,  1/3,  2/3]) * np.pi
+    yp = np.array([ 1/4,  1/4,  1/4, 1/4,  1/4, 1/4, -1/4, -1/4, -1/4, -1/4, -1/4, -1/4]) * np.pi
+    x = np.concatenate([xh, xp, [0, 0]])
+    y = np.concatenate([yh, yp, [np.pi/2., -np.pi/2]])
+
+    sepScene = separatePano(img.copy(), fov, x, y, cutSize)
+    edge = []
+    for scene in sepScene:
+        edgeMap, edgeList = lsdWrap(scene['img'])
+        edge.append({
+            'img': edgeMap,
+            'edgeLst': edgeList,
+            'vx': scene['vx'],
+            'vy': scene['vy'],
+            'fov': scene['fov'],
+        })
+        edge[-1]['panoLst'] = edgeFromImg2Pano(edge[-1])
+
+    lines, coordN_lines = combineEdgesN_v2(edge)
+    torch_line = torch.from_numpy(coordN_lines).to('cuda:0')
+    starts = torch_line[:, 3:6]
+    ends = torch_line[:, 6:]
+    dirs = ends - starts
+    line_t = torch.linspace(start=0, end=1, steps=100).reshape(1, -1, 1).to('cuda:0')
+    tot_pts = (dirs.unsqueeze(1) * line_t + starts.unsqueeze(1)).reshape(-1, 3)
+
+    theta = np.pi / 2
+    rot_mtx = torch.tensor([[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0., 0., 1.]]).to('cuda:0')
+    test_img = make_pano(tot_pts.float() @ rot_mtx.float(), torch.ones_like(tot_pts).float(), resolution=(500, 1000))
+
+    if return_edge_img:
+        panoEdge = paintParameterLine(lines, img.shape[1], img.shape[0])
+        return coordN_lines, panoEdge
+    else:
+        return coordN_lines
+
+
+def make_pano(xyz: torch.Tensor, rgb: torch.Tensor, resolution=(200, 400), 
+        return_torch: bool = False, return_coord: bool = False):
+    """
+    Make panorama image from xyz and rgb tensors
+
+    Args:
+        xyz: (N, 3) torch tensor containing xyz coordinates
+        rgb: (N, 3) torch tensor containing rgb values, ranged in [0, 1]
+        resolution: Tuple size of 2, returning panorama image of size resolution
+        return_torch: if True, return image as torch.Tensor
+                      if False, return image as numpy.array
+        return_coord: If True, return coordinate in long format
+
+    Returns:
+        image: (H, W, 3) torch.Tensor or numpy.array
+    """
+
+    with torch.no_grad():
+
+        # project farther points first
+        dist = torch.norm(xyz, dim=-1)
+        mod_idx = torch.argsort(dist)
+        mod_idx = torch.flip(mod_idx, dims=[0])
+        mod_xyz = xyz.clone().detach()[mod_idx]
+        mod_rgb = rgb.clone().detach()[mod_idx]
+
+        coord_idx = cloud2idx(mod_xyz)
+        coord_idx = (coord_idx + 1.0) / 2.0
+        # coord_idx[:, 0] is x coordinate, coord_idx[:, 1] is y coordinate
+        coord_idx[:, 0] *= (resolution[1] - 1)
+        coord_idx[:, 1] *= (resolution[0] - 1)
+
+        coord_idx = torch.flip(coord_idx, [-1])
+        coord_idx = coord_idx.long()
+        save_coord_idx = coord_idx.clone().detach()
+        coord_idx = tuple(coord_idx.t())
+
+        image = torch.zeros([resolution[0], resolution[1], 3], dtype=torch.float, device=xyz.device)
+
+        # color the image
+        # pad by 1
+        temp = torch.ones_like(coord_idx[0], device=xyz.device)
+        coord_idx1 = (torch.clamp(coord_idx[0] + temp, max=resolution[0] - 1),
+                      torch.clamp(coord_idx[1] + temp, max=resolution[1] - 1))
+        coord_idx2 = (torch.clamp(coord_idx[0] + temp, max=resolution[0] - 1),
+                      coord_idx[1])
+        coord_idx3 = (torch.clamp(coord_idx[0] + temp, max=resolution[0] - 1),
+                      torch.clamp(coord_idx[1] - temp, min=0))
+        coord_idx4 = (torch.clamp(coord_idx[0] - temp, min=0),
+                      torch.clamp(coord_idx[1] + temp, max=resolution[1] - 1))
+        coord_idx5 = (torch.clamp(coord_idx[0] - temp, min=0),
+                      coord_idx[1])
+        coord_idx6 = (torch.clamp(coord_idx[0] - temp, min=0),
+                      torch.clamp(coord_idx[1] - temp, min=0))
+        coord_idx7 = (coord_idx[0],
+                      torch.clamp(coord_idx[1] + temp, max=resolution[1] - 1))
+        coord_idx8 = (coord_idx[0],
+                      torch.clamp(coord_idx[1] - temp, min=0))
+
+        image.index_put_(coord_idx8, mod_rgb, accumulate=False)
+        image.index_put_(coord_idx7, mod_rgb, accumulate=False)
+        image.index_put_(coord_idx6, mod_rgb, accumulate=False)
+        image.index_put_(coord_idx5, mod_rgb, accumulate=False)
+        image.index_put_(coord_idx4, mod_rgb, accumulate=False)
+        image.index_put_(coord_idx3, mod_rgb, accumulate=False)
+        image.index_put_(coord_idx2, mod_rgb, accumulate=False)
+        image.index_put_(coord_idx1, mod_rgb, accumulate=False)
+        image.index_put_(coord_idx, mod_rgb, accumulate=False)
+
+        image = image * 255
+
+        if not return_torch:
+            image = image.cpu().numpy().astype(np.uint8)
+    if return_coord:
+        # mod_idx is in (i, j) format, not (x, y) format
+        inv_mod_idx = torch.argsort(mod_idx)
+        return image, save_coord_idx[inv_mod_idx]
+    else:
+        return image
+
+
+def cloud2idx(xyz: torch.Tensor, batched: bool = False) -> torch.Tensor:
+    """
+    Change 3d coordinates to image coordinates ranged in [-1, 1].
+
+    Args:
+        xyz: (N, 3) torch tensor containing xyz values of the point cloud data
+        batched: If True, performs batched operation with xyz considered as shape (B, N, 3)
+
+    Returns:
+        coord_arr: (N, 2) torch tensor containing transformed image coordinates
+    """
+    if batched:
+        # first project 3d coordinates to a unit sphere and obtain vertical/horizontal angle
+
+        # vertical angle
+        theta = torch.unsqueeze(torch.atan2((torch.norm(xyz[..., :2], dim=-1)), xyz[..., 2] + 1e-6), -1)  # (B, N, 1)
+
+        # horizontal angle
+        phi = torch.atan2(xyz[..., 1:2], xyz[..., 0:1] + 1e-6)  # (B, N, 1)
+        phi += np.pi
+
+        sphere_cloud_arr = torch.cat([phi, theta], dim=-1)  # (B, N, 2)
+
+        # image coordinates ranged in [0, 1]
+        coord_arr = torch.stack([1.0 - sphere_cloud_arr[..., 0] / (np.pi * 2), sphere_cloud_arr[..., 1] / np.pi], dim=-1)
+        # Rearrange so that the range is in [-1, 1]
+        coord_arr = (2 * coord_arr - 1)  # (B, N, 2)
+
+    else:
+        # first project 3d coordinates to a unit sphere and obtain vertical/horizontal angle
+
+        # vertical angle
+        theta = torch.unsqueeze(torch.atan2((torch.norm(xyz[:, :2], dim=-1)), xyz[:, 2] + 1e-6), 1)
+
+        # horizontal angle
+        phi = torch.atan2(xyz[:, 1:2], xyz[:, 0:1] + 1e-6)
+        phi += np.pi
+
+        sphere_cloud_arr = torch.cat([phi, theta], dim=-1)
+
+        # image coordinates ranged in [0, 1]
+        coord_arr = torch.stack([1.0 - sphere_cloud_arr[:, 0] / (np.pi * 2), sphere_cloud_arr[:, 1] / np.pi], dim=-1)
+        # Rearrange so that the range is in [-1, 1]
+        coord_arr = (2 * coord_arr - 1)
+
+    return coord_arr
 
 
 if __name__ == '__main__':

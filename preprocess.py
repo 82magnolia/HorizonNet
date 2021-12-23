@@ -20,7 +20,7 @@ import argparse
 import numpy as np
 from PIL import Image
 
-from misc.pano_lsd_align import panoEdgeDetection, rotatePanorama
+from misc.pano_lsd_align import panoEdgeDetection, panoEdgeDetection_v2, rotatePanorama
 
 
 parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -56,9 +56,13 @@ for i_path in paths:
     img_ori = np.array(Image.open(i_path).resize((1024, 512), Image.BICUBIC))[..., :3]
 
     # VP detection and line segment extraction
-    _, vp, _, _, panoEdge, _, _ = panoEdgeDetection(img_ori,
+    """
+    _, vp, _, _, panoEdge, _, _ = panoEdgeDetection(img_ori, viewSize=120,
                                                     qError=args.q_error,
                                                     refineIter=args.refine_iter)
+    """
+    coordN_lines, panoEdge = panoEdgeDetection_v2(img_ori, viewSize=120, return_edge_img=True)
+
     panoEdge = (panoEdge > 0)
 
     # Align images with VP
